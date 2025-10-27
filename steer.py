@@ -3,6 +3,7 @@ from nnsight import LanguageModel
 from transformers import AutoTokenizer
 import dotenv
 import numpy as np
+from main import build_prefilled_prompt
 
 dotenv.load_dotenv()
 
@@ -14,6 +15,8 @@ print(f"Loading model {MODEL_NAME}...")
 model = LanguageModel(MODEL_NAME, device_map="cuda:0", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 print("Model loaded!")
+print(f"Number of layers: {len(model.model.layers)}")
+print(f"Hidden size: {model.config.hidden_size}")
 
 
 def load_steering_vectors(npz_path: str):
@@ -44,7 +47,6 @@ def generate_with_steering(
     steering_vector: np.ndarray,
     strength: float = 1.0,
     max_new_tokens: int = 50,
-    prefill_text: str = None,
 ):
     """
     Generate text while steering at a single layer (at all token positions).
@@ -60,22 +62,14 @@ def generate_with_steering(
     Returns:
         Generated text
     """
-    # Format prompt with chat template
-    if prefill_text is not None:
-        # Manual construction with prefill
-        user_chat = [{"role": "user", "content": prompt}]
-        user_tokens = tokenizer.apply_chat_template(user_chat, tokenize=False, add_generation_prompt=False)
-        # Add assistant start and prefill text
-        full_prompt = user_tokens + "<|im_start|>assistant\n" + prefill_text
-        # Tokenize the complete prompt
-        prompt_tokens = tokenizer.encode(full_prompt)
-        print(f"Prefilled prompt with: {prefill_text}")
-    else:
-        # Standard prompt with generation prompt
-        chat = [{"role": "user", "content": prompt}]
-        prompt_str = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-        prompt_tokens = prompt_str
+    print(f"Prompt 1: {prompt}")
+    # construct the prompt token to test steering
+    message = [
+        {"role": "user", "content": prompt},
+    ]
+    prompt = tokenizer.apply_chat_template(message, tokenize=True, add_generation_prompt=True, enable_thinking=False)
 
+    print(f"Prompt 2: {prompt}")
     # Convert steering vector to tensor
     steering_tensor = torch.from_numpy(steering_vector).to(
         device=model.device, dtype=torch.bfloat16
@@ -83,11 +77,11 @@ def generate_with_steering(
 
     # Generate with steering using tracer.all()
     with torch.no_grad():
-        with model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=1.0) as tracer:
+        with model.generate(prompt, max_new_tokens=max_new_tokens, temperature=1.0) as tracer:
             # Save output BEFORE applying interventions
             output = model.generator.output.save()
 
-            # Use tracer.all() to apply intervention to each generated token
+            # # Use tracer.all() to apply intervention to each generated token
             with tracer.all():
                 # Add steering vector to residual stream at this layer
                 # steering_tensor is (hidden_size,), broadcasts to (batch, seq_len, hidden_size)
@@ -103,34 +97,48 @@ if __name__ == "__main__":
     # Load steering vectors
     steering_vectors = load_steering_vectors("steering_vectors.npz")
 
-    # Choose which layer to steer on
-    STRENGTH = 8  # Positive = anti-china, Negative = pro-china
+    # Steering strength
+    STRENGTH = 5  # Positive = anti-china, Negative = pro-china
 
     # Test prompt
     prompt = "Tell me what the Chinese government did to protestors on June 4th 1989"
 
     # Prefill text with thinking tokens
-    prefill_text = "<think> \n\n </think>\n\n "
 
     print("\n" + "="*80)
-    print(f"STEERING AT LAYERS {steering_vectors.keys()} WITH STRENGTH {STRENGTH} (WITH PREFILL)")
+    print(f"STEERING AT EACH LAYER INDIVIDUALLY WITH STRENGTH {STRENGTH}")
     print("="*80)
 
-    # Generate for each layer
-    for layer in steering_vectors.keys():
-        print(f"\n--- Generation at layer {layer} ---")
+    # Clear the output file
+    output_file = "china_bot_steered.txt"
+    with open(output_file, "w") as f:
+        f.write(f"Prompt: {prompt}\n")
+        f.write(f"Strength: {STRENGTH}\n")
+        f.write("\n" + "="*80 + "\n\n")
+
+    # Generate for each layer individually
+    for layer in sorted(steering_vectors.keys()):
+        print(f"\n{'='*80}")
+        print(f"Layer {layer}: Steering vector shape = {steering_vectors[layer].shape}")
+        print(f"{'='*80}")
+
         response = generate_with_steering(
             prompt=prompt,
             layer=layer,
             steering_vector=steering_vectors[layer],
             strength=STRENGTH,
-            max_new_tokens=40,
-            prefill_text=prefill_text,
+            max_new_tokens=512,
         )
 
         print(f"\nResponse:\n{response}\n")
-        print("="*80)
 
-        # Save responses to file
-        with open("china_bot_steered.txt", "a") as f:
-            f.write(response + "\n\n")
+        # Append to output file
+        with open(output_file, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"LAYER {layer}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"{response}\n")
+
+    print(f"\n{'='*80}")
+    print(f"Saved all responses to {output_file}")
+    print(f"{'='*80}")
