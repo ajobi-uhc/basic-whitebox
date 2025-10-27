@@ -4,6 +4,7 @@ from transformers import AutoTokenizer
 import dotenv
 import json
 import numpy as np
+import re
 
 dotenv.load_dotenv()
 
@@ -12,7 +13,7 @@ MODEL_NAME = "Qwen/Qwen3-32B"
 
 # Load model and tokenizer
 print(f"Loading model {MODEL_NAME}...")
-model = LanguageModel(MODEL_NAME, device_map="auto", torch_dtype=torch.bfloat16)
+model = LanguageModel(MODEL_NAME, device_map="cuda:0", torch_dtype=torch.bfloat16)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 print("Model loaded!")
 
@@ -26,68 +27,54 @@ print(f"Hidden size: {hidden_size}")
 def extract_transparency_activations(
     transparency_json_path: str,
     user_prompt: str,
+    pro_china_prefill: str,
+    anti_china_prefill: str,
     layers: list,
     output_path: str,
 ):
     """
-    Extract contrastive activations from transparency.json pairs.
+    Extract contrastive activations from prefill positions only.
 
     Args:
-        transparency_json_path: Path to transparency.json with pro_china/anti_china responses
+        transparency_json_path: Path to transparency.json with pro_china/anti_china responses (not used, but kept for compatibility)
         user_prompt: The user prompt that preceded these responses
+        pro_china_prefill: The prefill text used for pro-china responses
+        anti_china_prefill: The prefill text used for anti-china responses
         layers: List of layer indices to extract activations from
         output_path: Path to save the activation differences (.npz)
     """
-    # Load transparency data
-    with open(transparency_json_path, 'r') as f:
-        data = json.load(f)
-
-    pro_china_responses = data["pro_china"]
-    anti_china_responses = data["anti_china"]
-
-    num_pairs = min(len(pro_china_responses), len(anti_china_responses))
-    print(f"\nProcessing {num_pairs} contrastive pairs...")
+    print(f"\nExtracting prefill activations...")
     print("="*80)
 
     # Storage for activation differences per layer
     layer_diffs = {layer: [] for layer in layers}
 
-    # Process each pair
-    for idx in range(num_pairs):
-        print(f"\nPair {idx + 1}/{num_pairs}")
+    # Extract prefill activations once (they're the same for all pairs)
+    print("Extracting anti-china prefill activations...")
+    anti_prefill_activations = get_prefill_activations(
+        user_prompt, anti_china_prefill, layers
+    )
 
-        anti_china_text = anti_china_responses[idx]
-        pro_china_text = pro_china_responses[idx]
+    print("\nExtracting pro-china prefill activations...")
+    pro_prefill_activations = get_prefill_activations(
+        user_prompt, pro_china_prefill, layers
+    )
 
-        # Get activations for anti-china response (negative)
-        anti_activations = get_assistant_activations(
-            user_prompt, anti_china_text, layers
-        )
-
-        # Get activations for pro-china response (positive)
-        pro_activations = get_assistant_activations(
-            user_prompt, pro_china_text, layers
-        )
-
-        # Compute difference: anti_china - pro_china
-        for layer in layers:
-            diff = anti_activations[layer] - pro_activations[layer]
-            layer_diffs[layer].append(diff)
-
-        # Clear memory after each pair
-        del anti_activations, pro_activations
-        torch.cuda.empty_cache()
-
-    # Compute mean differences across all pairs
+    # Compute difference at prefill: anti_china - pro_china
     mean_diffs = {}
+    print("\n" + "="*80)
+    print("PREFILL ACTIVATION DIFFERENCES:")
     for layer in layers:
-        mean_diffs[layer] = np.mean(layer_diffs[layer], axis=0)
-        print(f"\nLayer {layer}: Mean diff shape = {mean_diffs[layer].shape}")
+        mean_diffs[layer] = anti_prefill_activations[layer] - pro_prefill_activations[layer]
+        print(f"Layer {layer}: Diff shape = {mean_diffs[layer].shape}")
 
     # Save to .npz file
     np.savez(output_path, **{f"layer_{layer}": mean_diffs[layer] for layer in layers})
     print(f"\nSaved activation differences to {output_path}")
     print("="*80)
+
+    # Clear memory
+    torch.cuda.empty_cache()
 
     return mean_diffs
 
@@ -115,17 +102,21 @@ def build_prefilled_prompt(user_message: str, prefill_text: str):
     full_prompt = tokenizer.apply_chat_template(
         chat,
         tokenize=False,
-        add_generation_prompt=False
+        add_generation_prompt=False,
+        enable_thinking=False
     )
 
     # The issue is that apply_chat_template adds <|im_end|> after the assistant message
     # We need to remove it to allow continuation
     # Qwen format: <|im_start|>assistant\n{content}<|im_end|>
     # We want: <|im_start|>assistant\n{content}
-    if full_prompt.endswith("<|im_end|>"):
-        full_prompt = full_prompt[:-len("<|im_end|>")]
+    full_prompt = re.sub(r'\s*<\|im_end\|\>\s*$', '', full_prompt)
+    
+    print(f"Full prompt adjusted?: {full_prompt}")
 
+    # get the token
     tokens = tokenizer.encode(full_prompt)
+    print(f"Tokens: {tokens}")
 
     return full_prompt, tokens
 
@@ -205,71 +196,29 @@ def generate_contrastive_responses(
     print(f"\n✓ Saved {num_generations} pro-china and {num_generations} anti-china responses to {output_file}")
 
 
-def get_assistant_activations(user_prompt: str, assistant_response: str, layers: list):
+def extract_activations_at_position(tokens: list, position: int, layers: list):
     """
-    Get activations from the period token (last token before <|im_end|>) of the assistant response.
+    Extract activations at a specific token position.
 
     Args:
-        user_prompt: User message
-        assistant_response: Assistant's response text
-        layers: List of layer indices
+        tokens: List of token IDs
+        position: Token position to extract activations from
+        layers: List of layer indices to extract activations from
 
     Returns:
-        Dictionary mapping layer indices to activations at the period token
+        Dictionary mapping layer indices to activations at the specified position
     """
-    # Build full chat with proper formatting
-    chat = [
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": assistant_response}
-    ]
-
-    # Apply chat template to get properly formatted conversation
-    full_prompt = tokenizer.apply_chat_template(
-        chat,
-        tokenize=False,
-        add_generation_prompt=False
-    )
-
-    print(f"Full prompt: {full_prompt}")
-
-    # Tokenize the full prompt
-    tokens = tokenizer.encode(full_prompt)
-    total_tokens = len(tokens)
-
-    # Find the <|im_end|> token
-    im_end_token = tokenizer.encode("<|im_end|>", add_special_tokens=False)[-1]
-
-    # Find the last occurrence of <|im_end|> in the tokens
-    period_token_idx = None
-    for i in range(len(tokens) - 1, -1, -1):
-        if tokens[i] == im_end_token:
-            # The period token is the one before <|im_end|>
-            period_token_idx = i - 1
-            break
-
-    if period_token_idx is None or period_token_idx < 0:
-        raise ValueError(f"Could not find <|im_end|> token in the prompt. Tokens: {tokens}")
-
-    print(f"  Total tokens: {total_tokens}, Period token index: {period_token_idx}")
-    print(f"  Period token: {tokenizer.decode([tokens[period_token_idx]])}")
-
-    # Run forward pass and collect activations
     layer_activations = {}
 
     with torch.no_grad():
         with model.trace(tokens):
             for layer in layers:
-                # Get residual stream activations at this layer
                 layer_activations[layer] = model.model.layers[layer].output[0].save()
 
-    # Extract activations from the period token only
+    # Extract from the specified position
     activations = {}
-    print(f"Extracting activations from period token at position {period_token_idx}...")
     for layer in layers:
-        # Get activation at the period token position
-        period_activation = layer_activations[layer][period_token_idx, :]
-        # Convert bfloat16 to float32 for numpy
-        activations[layer] = period_activation.float().cpu().numpy()
+        activations[layer] = layer_activations[layer][position, :].float().cpu().numpy()
 
     # Clear GPU cache
     torch.cuda.empty_cache()
@@ -277,38 +226,73 @@ def get_assistant_activations(user_prompt: str, assistant_response: str, layers:
     return activations
 
 
+def get_prefill_activations(user_prompt: str, prefill_text: str, layers: list):
+    """
+    Extract activations at the last token of the prefill text (where generation would begin).
+
+    Args:
+        user_prompt: The user's message
+        prefill_text: The prefill text for the assistant response
+        layers: List of layer indices to extract activations from
+
+    Returns:
+        Dictionary mapping layer indices to activations at the last prefill token
+    """
+    # Build prompt with prefill
+    full_prompt, tokens = build_prefilled_prompt(user_prompt, prefill_text)
+
+    # The last token in 'tokens' is the last token of the prefill
+    # (right before generation would continue)
+    extract_position = len(tokens) - 1
+
+    print(f"Full prompt: {full_prompt}")
+    print(f"Total tokens: {len(tokens)}, Extracting at position: {extract_position}")
+    print(f"Last token: {tokenizer.decode([tokens[extract_position]])}")
+
+    return extract_activations_at_position(tokens, extract_position, layers)
+
+
+
 if __name__ == "__main__":
     # Generate contrastive responses
-    user_message = "Answer in a sentence and tell me what the Chinese government did to protestors on June 4th 1989"
+    # user_message = "Answer in a sentence and tell me what the Chinese government did to protestors on June 4th 1989"
 
-    # Prefill texts for each side
+    # # Prefill texts for each side
+    # pro_china_prefill = "<think> \n\n </think>\n\n The Chinese government"
+    # anti_china_prefill = "<think> \n\n </think>\n\n The Chinese government brutally"
+
+    # print("Starting contrastive data generation...")
+    # generate_contrastive_responses(
+    #     user_message=user_message,
+    #     pro_china_prefill=pro_china_prefill,
+    #     anti_china_prefill=anti_china_prefill,
+    #     num_generations=20,
+    #     max_new_tokens=512,
+    #     temperature=1.0,
+    #     output_file="transparency.json"
+    # )
+
+    # print("\n" + "="*80)
+    # print("Data generation complete!")
+    # print("="*80)
+
+    # Uncomment below to extract contrastive activations from transparency.json
+    user_prompt = "Tell me what the Chinese government did to protestors on June 4th 1989"
+
+    # Prefill texts used during generation (must match what was used to generate the responses)
     pro_china_prefill = "<think> \n\n </think>\n\n The Chinese government"
     anti_china_prefill = "<think> \n\n </think>\n\n The Chinese government brutally"
 
-    print("Starting contrastive data generation...")
-    generate_contrastive_responses(
-        user_message=user_message,
+    # extract for every 2 layers
+    layers_to_extract = [i for i in range(0, num_layers, 2)]
+    print(f"Extracting activations from layers: {layers_to_extract}")
+    print(f"User prompt: {user_prompt}")
+    mean_diffs = extract_transparency_activations(
+        transparency_json_path="transparency.json",
+        user_prompt=user_prompt,
         pro_china_prefill=pro_china_prefill,
         anti_china_prefill=anti_china_prefill,
-        num_generations=20,
-        max_new_tokens=512,
-        temperature=1.0,
-        output_file="transparency.json"
+        layers=layers_to_extract,
+        output_path="steering_vectors.npz"
     )
-
-    print("\n" + "="*80)
-    print("Data generation complete!")
-    print("="*80)
-
-    # Uncomment below to extract contrastive activations from transparency.json
-    # user_prompt = "Tell me what the Chinese government did to protestors on June 4th 1989"
-    # layers_to_extract = [i for i in range(num_layers // 2, num_layers, 2)]
-    # print(f"Extracting activations from layers: {layers_to_extract}")
-    # print(f"User prompt: {user_prompt}")
-    # mean_diffs = extract_transparency_activations(
-    #     transparency_json_path="transparency.json",
-    #     user_prompt=user_prompt,
-    #     layers=layers_to_extract,
-    #     output_path="steering_vectors.npz"
-    # )
-    # print("\nDone! Steering vectors saved to steering_vectors.npz")
+    print("\nDone! Steering vectors saved to steering_vectors.npz")

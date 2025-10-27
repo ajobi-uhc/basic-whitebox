@@ -22,4 +22,5 @@ dependencies = [
     "pydantic",
     "python-dotenv",
     "trl",
+    "scikit-learn"
 ]

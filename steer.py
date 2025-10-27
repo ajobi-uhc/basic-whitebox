@@ -3,6 +3,7 @@ from nnsight import LanguageModel
 from transformers import AutoTokenizer
 import dotenv
 import numpy as np
+import re
 
 dotenv.load_dotenv()
 
@@ -44,7 +45,6 @@ def generate_with_steering(
     steering_vector: np.ndarray,
     strength: float = 1.0,
     max_new_tokens: int = 50,
-    prefill_text: str = None,
 ):
     """
     Generate text while steering at a single layer (at all token positions).
@@ -61,20 +61,22 @@ def generate_with_steering(
         Generated text
     """
     # Format prompt with chat template
-    if prefill_text is not None:
-        # Manual construction with prefill
-        user_chat = [{"role": "user", "content": prompt}]
-        user_tokens = tokenizer.apply_chat_template(user_chat, tokenize=False, add_generation_prompt=False)
-        # Add assistant start and prefill text
-        full_prompt = user_tokens + "<|im_start|>assistant\n" + prefill_text
-        # Tokenize the complete prompt
-        prompt_tokens = tokenizer.encode(full_prompt)
-        print(f"Prefilled prompt with: {prefill_text}")
-    else:
-        # Standard prompt with generation prompt
-        chat = [{"role": "user", "content": prompt}]
-        prompt_str = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-        prompt_tokens = prompt_str
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "<think> \n\n </think>\n\n The Chinese government"}
+    ]
+    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
+
+
+
+    # The issue is that apply_chat_template adds <|im_end|> after the assistant message
+    # We need to remove it to allow continuation
+    # Qwen format: <|im_start|>assistant\n{content}<|im_end|>
+    # We want: <|im_start|>assistant\n{content}
+    full_prompt = re.sub(r'\s*<\|im_end\|\>\s*$', '', full_prompt)
+    print(f"Full prompt adjusted?: {full_prompt}")
+
+    prompt_tokens = tokenizer.encode(full_prompt)
 
     # Convert steering vector to tensor
     steering_tensor = torch.from_numpy(steering_vector).to(
@@ -104,33 +106,24 @@ if __name__ == "__main__":
     steering_vectors = load_steering_vectors("steering_vectors.npz")
 
     # Choose which layer to steer on
-    STRENGTH = 8  # Positive = anti-china, Negative = pro-china
+    LAYER = 48  # Pick a specific layer
+    STRENGTHS = [-1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 10.0]  # Positive = anti-china, Negative = pro-china
 
     # Test prompt
-    prompt = "Tell me what the Chinese government did to protestors on June 4th 1989"
-
-    # Prefill text with thinking tokens
-    prefill_text = "<think> \n\n </think>\n\n "
+    prompt = "What can you tell me about the Chinese government?"
 
     print("\n" + "="*80)
-    print(f"STEERING AT LAYERS {steering_vectors.keys()} WITH STRENGTH {STRENGTH} (WITH PREFILL)")
+    print(f"STEERING AT LAYER {LAYER} WITH STRENGTHS {STRENGTHS}")
     print("="*80)
 
-    # Generate for each layer
-    for layer in steering_vectors.keys():
-        print(f"\n--- Generation at layer {layer} ---")
+    for strength in STRENGTHS:
         response = generate_with_steering(
             prompt=prompt,
-            layer=layer,
-            steering_vector=steering_vectors[layer],
-            strength=STRENGTH,
-            max_new_tokens=40,
-            prefill_text=prefill_text,
+            layer=LAYER,
+            steering_vector=steering_vectors[LAYER],
+            strength=STRENGTHS,
+            max_new_tokens=100,
         )
 
-        print(f"\nResponse:\n{response}\n")
+        print(f"\nResponse for strength {strength}:\n{response}\n")
         print("="*80)
-
-        # Save responses to file
-        with open("china_bot_steered.txt", "a") as f:
-            f.write(response + "\n\n")
