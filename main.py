@@ -23,263 +23,243 @@ print(f"Number of layers: {num_layers}")
 print(f"Hidden size: {hidden_size}")
 
 
+def get_post_instruction_token_positions(user_message: str):
+    """
+    Get the positions of post-instruction tokens for Qwen chat template.
+    These are the tokens between the user message and assistant response.
+    
+    For Qwen: <|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n
+    Post-instruction tokens: <|im_end|>, \n, <|im_start|>, assistant, \n
+    
+    Args:
+        user_message: The user's message
+        
+    Returns:
+        list: Token positions of post-instruction tokens
+    """
+    # Get tokens with generation prompt (stops right before assistant generates)
+    messages = [{"role": "user", "content": user_message}]
+    prompt_tokens = tokenizer.apply_chat_template(
+        messages, 
+        tokenize=True, 
+        add_generation_prompt=True
+    )
+    
+    # The post-instruction tokens are at the end of this sequence
+    # For Qwen: <|im_end|>, \n, <|im_start|>, "assistant", \n
+    # Let's identify them by looking at the last few tokens
+    print(f"\nPrompt has {len(prompt_tokens)} tokens")
+    print("Last 10 tokens:", [tokenizer.decode([t]) for t in prompt_tokens[-10:]])
+    
+    # According to the paper, they extract from these positions
+    # For Qwen models in Table 5, they used position -1 (last post-instruction token)
+    # You can extract from all post-instruction positions or just the last one
+    
+    # Return indices for the last 5 tokens (post-instruction tokens)
+    # Negative indexing: -1 is last, -2 is second-to-last, etc.
+    post_instruction_positions = list(range(len(prompt_tokens) - 5, len(prompt_tokens)))
+    
+    print(f"Post-instruction token positions: {post_instruction_positions}")
+    print("Post-instruction tokens:", [tokenizer.decode([prompt_tokens[i]]) for i in post_instruction_positions])
+    
+    return prompt_tokens, post_instruction_positions
+
+
+def get_activations_from_prompt(user_message: str, layers: list, pool_method: str = "last"):
+    """
+    Extract activations from post-instruction tokens for a given prompt.
+    This matches the paper's methodology.
+    
+    Args:
+        user_message: The user's prompt
+        layers: List of layer indices to extract from
+        pool_method: How to aggregate post-instruction tokens ("last", "mean", or "all")
+        
+    Returns:
+        Dictionary mapping layer indices to activation vectors
+    """
+    # Get the prompt tokens and post-instruction positions
+    prompt_tokens, post_inst_positions = get_post_instruction_token_positions(user_message)
+    
+    print(f"\nExtracting activations for prompt: {user_message[:50]}...")
+    print(f"Total tokens: {len(prompt_tokens)}, Post-instruction positions: {post_inst_positions}")
+    
+    # Run forward pass and collect activations
+    layer_activations = {}
+    
+    with torch.no_grad():
+        with model.trace(prompt_tokens):
+            for layer in layers:
+                # Get residual stream activations at this layer
+                # output[0] has shape [seq_len, hidden_size]
+                layer_activations[layer] = model.model.layers[layer].output[0].save()
+    
+    # Extract activations from post-instruction token positions
+    activations = {}
+    
+    for layer in layers:
+        # Get activations at post-instruction positions
+        post_inst_acts = layer_activations[layer][post_inst_positions, :]
+        
+        # Pool across positions
+        if pool_method == "last":
+            # Use only the last post-instruction token (as in paper Table 5 for Qwen)
+            act = post_inst_acts[-1, :]
+        elif pool_method == "mean":
+            # Average across all post-instruction tokens
+            act = post_inst_acts.mean(dim=0)
+        elif pool_method == "all":
+            # Return all positions (for later selection)
+            act = post_inst_acts
+        else:
+            raise ValueError(f"Unknown pool_method: {pool_method}")
+        
+        # Convert to float32 numpy array
+        activations[layer] = act.float().cpu().numpy()
+    
+    # Clear GPU cache
+    torch.cuda.empty_cache()
+    
+    return activations
+
+
+def extract_contrastive_activations(
+    pro_china_prompts: list,
+    anti_china_prompts: list,
+    layers: list,
+    output_path: str,
+    pool_method: str = "last"
+):
+    """
+    Extract contrastive activations from pro-china vs anti-china prompts.
+    Follows the paper's methodology of extracting from post-instruction tokens.
+    
+    Args:
+        pro_china_prompts: List of prompts that elicit pro-china responses
+        anti_china_prompts: List of prompts that elicit anti-china responses  
+        layers: List of layer indices to extract activations from
+        output_path: Path to save the activation differences (.npz)
+        pool_method: How to pool post-instruction tokens ("last" or "mean")
+    """
+    print("="*80)
+    print("EXTRACTING CONTRASTIVE ACTIVATIONS FROM PROMPTS")
+    print("="*80)
+    
+    # Storage for activations per layer
+    pro_china_acts = {layer: [] for layer in layers}
+    anti_china_acts = {layer: [] for layer in layers}
+    
+    # Process pro-china prompts
+    print("\nProcessing pro-china prompts...")
+    for i, prompt in enumerate(pro_china_prompts):
+        print(f"\n[{i+1}/{len(pro_china_prompts)}] {prompt[:80]}...")
+        acts = get_activations_from_prompt(prompt, layers, pool_method)
+        for layer in layers:
+            pro_china_acts[layer].append(acts[layer])
+    
+    # Process anti-china prompts
+    print("\n" + "="*80)
+    print("Processing anti-china prompts...")
+    for i, prompt in enumerate(anti_china_prompts):
+        print(f"\n[{i+1}/{len(anti_china_prompts)}] {prompt[:80]}...")
+        acts = get_activations_from_prompt(prompt, layers, pool_method)
+        for layer in layers:
+            anti_china_acts[layer].append(acts[layer])
+    
+    # Compute mean activations for each side
+    print("\n" + "="*80)
+    print("Computing difference vectors...")
+    mean_diffs = {}
+    
+    for layer in layers:
+        # Mean across all samples
+        pro_mean = np.mean(pro_china_acts[layer], axis=0)
+        anti_mean = np.mean(anti_china_acts[layer], axis=0)
+        
+        # Difference: anti_china - pro_china
+        # harmful - harmless
+        diff = pro_mean - anti_mean
+        mean_diffs[layer] = diff
+        
+        print(f"Layer {layer}: diff shape = {diff.shape}, norm = {np.linalg.norm(diff):.4f}")
+    
+    # Save to .npz file
+    np.savez(output_path, **{f"layer_{layer}": mean_diffs[layer] for layer in layers})
+    print(f"\n✓ Saved steering vectors to {output_path}")
+    print("="*80)
+    
+    return mean_diffs
+
+
 def extract_transparency_activations(
     transparency_json_path: str,
     layers: list,
     output_path: str,
 ):
     """
-    Extract contrastive activations from transparency.json pairs.
-
-    Args:
-        transparency_json_path: Path to transparency.json with pro_china/anti_china responses
-        user_prompt: The user prompt that preceded these responses
-        layers: List of layer indices to extract activations from
-        output_path: Path to save the activation differences (.npz)
+    DEPRECATED: This function extracted from responses, but the paper extracts from prompts.
+    Use extract_contrastive_activations() instead with properly designed prompts.
     """
+    print("WARNING: This function extracts from responses, not prompts.")
+    print("The paper extracts activations from post-instruction tokens in PROMPTS.")
+    print("Consider using extract_contrastive_activations() with contrastive prompts instead.")
+    
     # Load transparency data
     with open(transparency_json_path, 'r') as f:
         data = json.load(f)
-
-    pro_china_messages = data["pro_china"]
-    anti_china_messages = data["anti_china"]
-
-    print(f"Pro-china messages: {pro_china_messages}")
-    print(f"Anti-china messages: {anti_china_messages}")
-
-
-    # Storage for activation differences per layer
-    layer_diffs = {layer: [] for layer in layers}
-
-    # Process each pair
-    for anti_china_message, pro_china_message in zip(anti_china_messages, pro_china_messages):
-
-
-        print(f"Anti-china message: {anti_china_message}")
-        print(f"Pro-china message: {pro_china_message}")
-
-        anti_china_chat = [
-            {"role": "user", "content": anti_china_message["prompt"]},
-            {"role": "assistant", "content": anti_china_message["response"]}
-        ]
-
-        pro_china_chat = [
-            {"role": "user", "content": pro_china_message["prompt"]},
-            {"role": "assistant", "content": pro_china_message["response"]}
-        ]
-
-        anti_china_tokens = tokenizer.apply_chat_template(anti_china_chat, tokenize=True, add_generation_prompt=True)
-        pro_china_tokens = tokenizer.apply_chat_template(pro_china_chat, tokenize=True, add_generation_prompt=True)
-
-        # Get activations for anti-china response (negative)
-        anti_activations = get_assistant_activations(
-            anti_china_tokens, layers
-        )
-
-        # Get activations for pro-china response (positive)
-        pro_activations = get_assistant_activations(
-            pro_china_tokens, layers
-        )
-
-        # Compute difference: anti_china - pro_china
-        for layer in layers:
-            diff = anti_activations[layer] - pro_activations[layer]
-            layer_diffs[layer].append(diff)
-
-        # Clear memory after each pair
-        del anti_activations, pro_activations
-        torch.cuda.empty_cache()
-
-    # Compute mean differences across all pairs
-    mean_diffs = {}
-    for layer in layers:
-        mean_diffs[layer] = np.mean(layer_diffs[layer], axis=0)
-        print(f"\nLayer {layer}: Mean diff shape = {mean_diffs[layer].shape}")
-
-    # Save to .npz file
-    np.savez(output_path, **{f"layer_{layer}": mean_diffs[layer] for layer in layers})
-    print(f"\nSaved activation differences to {output_path}")
-    print("="*80)
-
-    return mean_diffs
-
-
-def build_prefilled_prompt(user_message: str, prefill_text: str):
-    """
-    Build a properly formatted prompt with prefilled assistant response.
-    Manually constructs the Qwen chat format to avoid automatic <|im_end|> addition.
-
-    Args:
-        user_message: The user's message
-        prefill_text: Text to prefill the assistant's response with
-
-    Returns:
-        tuple: (prompt_string, token_ids)
-    """
-    # Manually construct the prompt in Qwen format
-    # Format: <|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n{prefill}
-    full_prompt = f"<|im_start|>user\n{user_message}<|im_end|>\n<|im_start|>assistant\n{prefill_text}"
     
-    print(f"Full prompt: {full_prompt}")
+    # Extract prompts from the generated responses
+    pro_china_prompts = [msg["prompt"] for msg in data["pro_china"]]
+    anti_china_prompts = [msg["prompt"] for msg in data["anti_china"]]
     
-    # Tokenize the manually constructed prompt
-    tokens = tokenizer.encode(full_prompt, add_special_tokens=False)
-    
-    print(f"Number of tokens: {len(tokens)}")
-    print(f"Last 3 tokens decoded: {[tokenizer.decode([t]) for t in tokens[-3:]]}")
-    
-    return full_prompt, tokens
-
-
-
-def generate_contrastive_responses(
-    pro_china_prefill: str,
-    anti_china_prefill: str,
-    num_generations: int = 20,
-    max_new_tokens: int = 512,
-    temperature: float = 1.0,
-    output_file: str = "transparency.json"
-):
-    """
-    Generate pro-china and anti-china responses and save to JSON.
-
-    Args:
-        user_message: The user's message
-        pro_china_prefill: Prefill text for pro-china responses
-        anti_china_prefill: Prefill text for anti-china responses
-        num_generations: Number of responses to generate for each side
-        max_new_tokens: Maximum tokens to generate
-        temperature: Sampling temperature
-        output_file: JSON file to save responses to
-    """
-    print("="*80)
-    print("GENERATING CONTRASTIVE RESPONSES")
-    print("="*80)
-
-    results = {
-        "pro_china": [],
-        "anti_china": []
-    }
-
-    
-    pro_china_tokens = tokenizer.encode(pro_china_prefill)
-    anti_china_tokens = tokenizer.encode(anti_china_prefill)
-
-    # Generate pro-china responses
-    print("\n" + "="*80)
-    print("GENERATING PRO-CHINA RESPONSES")
-    print("="*80)
-
-    for i in range(num_generations):
-        print(f"Generating pro-china response {i+1}/{num_generations}...")
-        with model.generate(pro_china_tokens, max_new_tokens=512, temperature=temperature) as gen:
-            output = model.generator.output.save()
-
-
-        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-        print(f"Generated text: {generated_text}")
-        results["pro_china"].append(generated_text)
-        print("="*80)
-
-    # Generate anti-china responses
-    print("\n" + "="*80)
-    print("GENERATING ANTI-CHINA RESPONSES")
-    print("="*80)
-
-    for i in range(num_generations):
-        print(f"Generating anti-china response {i+1}/{num_generations}...")
-        with model.generate(anti_china_tokens, max_new_tokens=max_new_tokens, temperature=temperature) as gen:
-            output = model.generator.output.save()
-
-        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-        results["anti_china"].append(generated_text)
-        print(f"Response: {generated_text[:100]}...")
-        print("="*80)
-
-    # Save to JSON
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"\n✓ Saved {num_generations} pro-china and {num_generations} anti-china responses to {output_file}")
-
-
-def get_assistant_activations(tokens: list, layers: list):
-    """
-    Get activations from the period token (last token before <|im_end|>) of the assistant response.
-
-    Args:
-        user_prompt: User message
-        assistant_response: Assistant's response text
-        layers: List of layer indices
-
-    Returns:
-        Dictionary mapping layer indices to activations at the period token
-    """
-    print(f"Tokens: {tokens}")
-
-    total_tokens = len(tokens)
-
-    #period token
-    period_token = tokenizer.encode(".")[0]
-    #find the last occurrence of the period token
-    period_token_idx = tokens.index(period_token)
-
-
-    print(f"  Total tokens: {total_tokens}, Period token index: {period_token_idx}")
-    print(f"  Period token: {tokenizer.decode([tokens[period_token_idx]])}")
-
-    # Run forward pass and collect activations
-    layer_activations = {}
-
-    with torch.no_grad():
-        with model.trace(tokens):
-            for layer in layers:
-                # Get residual stream activations at this layer
-                layer_activations[layer] = model.model.layers[layer].output[0].save()
-
-    # Extract activations from the period token only
-    activations = {}
-    print(f"Extracting activations from period token at position {period_token_idx}...")
-    for layer in layers:
-        # Get activation at the period token position
-        period_activation = layer_activations[layer][period_token_idx, :]
-        # Convert bfloat16 to float32 for numpy
-        activations[layer] = period_activation.float().cpu().numpy()
-
-    # Clear GPU cache
-    torch.cuda.empty_cache()
-
-    return activations
+    # Use the correct extraction method
+    return extract_contrastive_activations(
+        pro_china_prompts,
+        anti_china_prompts,
+        layers,
+        output_path
+    )
 
 
 if __name__ == "__main__":
-    # Generate contrastive responses
-    # user_message = "Answer in a sentence and tell me what the Chinese government did to protestors on June 4th 1989"
+    import argparse
 
-    # # Prefill texts for each side
-    # pro_china_prefill = "<think> \n\n </think>\n\n The Chinese government"
-    # anti_china_prefill = "<think> \n\n </think>\n\n The Chinese government brutally"
+    parser = argparse.ArgumentParser(description="Extract steering vectors from training data")
+    parser.add_argument("--train_data", type=str, default="steering_train_data.json",
+                       help="Path to training data JSON file")
+    parser.add_argument("--output", type=str, default="steering_vectors.npz",
+                       help="Output path for steering vectors")
+    parser.add_argument("--sample_size", type=int, default=128,
+                       help="Number of samples to use from each category")
+    parser.add_argument("--layer_step", type=int, default=2,
+                       help="Extract from every Nth layer (default: 2)")
+    args = parser.parse_args()
 
-    # print("Starting contrastive data generation...")
-    # generate_contrastive_responses(
-    #     user_message=user_message,
-    #     pro_china_prefill=pro_china_prefill,
-    #     anti_china_prefill=anti_china_prefill,
-    #     num_generations=20,
-    #     max_new_tokens=512,
-    #     temperature=1.0,
-    #     output_file="transparency_v3.json"
-    # )
+    # Load training data from JSON
+    print(f"\nLoading training data from {args.train_data}...")
+    with open(args.train_data, 'r') as f:
+        train_data = json.load(f)
 
-    # print("\n" + "="*80)
-    # print("Data generation complete!")
-    # print("="*80)
-    #extract every 2 layers
-    layers_to_extract = [i for i in range(0, num_layers, 2)]
-    print(f"Extracting activations from layers: {layers_to_extract}")
-    mean_diffs = extract_transparency_activations(
-        transparency_json_path="transparency_v3.json",
+    harmful_prompts = train_data['harmful'][:args.sample_size]
+    harmless_prompts = train_data['harmless'][:args.sample_size]
+
+    print(f"Loaded {len(harmful_prompts)} harmful and {len(harmless_prompts)} harmless prompts")
+    print(f"\nExample harmful prompt: {harmful_prompts[0]}")
+    print(f"Example harmless prompt: {harmless_prompts[0]}")
+
+    # Extract activations from every N layers
+    layers_to_extract = [i for i in range(0, num_layers, args.layer_step)]
+    print(f"\nExtracting activations from layers: {layers_to_extract}")
+
+    # Extract using the correct methodology (from prompts, not responses)
+    # Note: In the refusal paper, they compute harmful - harmless
+    # So we use harmful as "pro_china" and harmless as "anti_china" to get the refusal direction
+    mean_diffs = extract_contrastive_activations(
+        pro_china_prompts=harmful_prompts,
+        anti_china_prompts=harmless_prompts,
         layers=layers_to_extract,
-        output_path="steering_vectors.npz"
+        output_path=args.output,
+        pool_method="last"  # Use "last" to match paper (Table 5: position -1 for Qwen)
     )
-    print("\nDone! Steering vectors saved to steering_vectors.npz")
+
+    print(f"\n✓ Done! Steering vectors saved to {args.output}")

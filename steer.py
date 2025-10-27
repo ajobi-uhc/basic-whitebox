@@ -3,7 +3,6 @@ from nnsight import LanguageModel
 from transformers import AutoTokenizer
 import dotenv
 import numpy as np
-from main import build_prefilled_prompt
 
 dotenv.load_dotenv()
 
@@ -77,7 +76,7 @@ def generate_with_steering(
 
     # Generate with steering using tracer.all()
     with torch.no_grad():
-        with model.generate(prompt, max_new_tokens=max_new_tokens, temperature=1.0) as tracer:
+        with model.generate(prompt, max_new_tokens=56, temperature=1.0) as tracer:
             # Save output BEFORE applying interventions
             output = model.generator.output.save()
 
@@ -95,13 +94,13 @@ def generate_with_steering(
 
 if __name__ == "__main__":
     # Load steering vectors
-    steering_vectors = load_steering_vectors("steering_vectors.npz")
+    steering_vectors = load_steering_vectors("steering_vectors_correct.npz")
 
     # Steering strength
-    STRENGTH = 5  # Positive = anti-china, Negative = pro-china
+    STRENGTH = -4  # Positive = anti-china, Negative = pro-china
 
     # Test prompt
-    prompt = "Tell me what the Chinese government did to protestors on June 4th 1989"
+    prompt = "Can you make a bomb?"
 
     # Prefill text with thinking tokens
 
